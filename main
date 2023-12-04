@@ -1,0 +1,236 @@
+#include <stdio.h>
+#include <stdbool.h>
+#include <unistd.h>
+
+// MQTT Libraries
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// Harware Libraries
+#include "driver/ledc.h"
+#include "driver/gpio.h"
+#include "driver/pcnt.h"
+#include "driver/adc.h"
+
+// Hardware definitions
+#define PWM_GPIO			25
+#define PCNT_INPUT_SIG_IO   4  // Encoder Channel A
+#define PCNT_INPUT_CTRL_IO  5  // Encoder Channel B
+#define GPI_M1				22			// Autmatic mode
+#define GPI_M2				23			// Manual Mode
+#define GPI_Stp				21
+#define GPO_Sat				2
+
+// Software definitions
+#define MaxPWM 8191
+
+
+
+static void pcnt_init(int unit);
+int constrain(int val,int Linf, int Lsup);
+void gpio_init();
+void ledc_init();
+void ADC_init();
+
+ledc_timer_config_t pwm_timer;
+ledc_channel_config_t pwm_channel;
+
+int pcnt_unit = PCNT_UNIT_0;
+int16_t count = 0;
+
+#define PID 0
+#define SSC 1
+#define PI 2
+
+//General variables
+#define Gen_Dly		 50
+#define SPEED_FACTOR 500.0
+#define ALPHA 0.1
+int SetPoint=85;
+float Raw=0.0;
+int   input=0;
+float error=0;
+float Ts=Gen_Dly/1000.0;
+float W=0;
+int   V=0;
+uint8_t Mode=PID;
+
+
+//PID variables
+float PID_Kp =80;
+float PID_Ki =220;
+float PID_Kd =2;
+
+// SSC variables
+float SSC_Kp = 80; //30
+float SSC_Ki = 180; //80
+
+static float valor_ant = 0.0;
+static float error_ant = 0.0;
+static float error_ant2 = 0.0;
+
+
+
+void IRAM_ATTR Mode_isr(void* p) {
+
+	if(gpio_get_level(GPI_M1)){
+		if(gpio_get_level(GPI_M2)){Mode=PID;}
+		else{Mode=SSC;}
+	}
+	else{Mode=PI;}
+}
+void app_main(void)
+{
+
+    // GPIO n PWM Configuration
+    gpio_init();
+    ledc_init();
+    ADC_init();
+    /* Initialize PPCNT functions */
+    pcnt_init(pcnt_unit);
+    pcnt_counter_pause(pcnt_unit);
+
+    ledc_set_duty(pwm_channel.speed_mode, pwm_channel.channel, input);
+    ledc_update_duty(pwm_channel.speed_mode, pwm_channel.channel);
+
+    gpio_set_intr_type(GPI_M1, GPIO_INTR_ANYEDGE);
+    gpio_set_intr_type(GPI_M2, GPIO_INTR_ANYEDGE);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(GPI_M1,Mode_isr,NULL);
+    gpio_isr_handler_add(GPI_M2,Mode_isr,NULL);
+
+
+    while (true) {
+
+    	Raw=(adc1_get_raw(ADC1_CHANNEL_0)/10.0);
+
+    	SetPoint= (ALPHA * Raw) + ((1 - ALPHA) * SetPoint); // discrete low pass filter
+
+    	pcnt_counter_clear(pcnt_unit);
+    	pcnt_counter_resume(pcnt_unit);
+    	vTaskDelay(Gen_Dly / portTICK_PERIOD_MS);
+    	pcnt_get_counter_value(pcnt_unit, &count);
+    	pcnt_counter_pause(pcnt_unit);
+    	W = (float)((count/SPEED_FACTOR)/(Ts)*(60.0));
+    	error = SetPoint - W;
+
+    	switch(Mode){
+
+    	case PID:
+ 			input = valor_ant + (PID_Kp + PID_Ki*(Ts/2) + PID_Kd/Ts)*error + (-PID_Kp + PID_Ki*(Ts/2) - 2*(PID_Kd/Ts))*error_ant + (PID_Kd/Ts)*error_ant2;
+    	break;
+
+    	case PI:
+    		input = valor_ant + (PID_Kp + PID_Ki*(Ts/2))*error + (-PID_Kp + PID_Ki*(Ts/2))*error_ant;
+    	break;
+
+    	case SSC:
+    		input = valor_ant + (SSC_Kp + SSC_Ki*(Ts/2))* error + (-SSC_Kp + SSC_Ki*(Ts/2))*error_ant;
+    	break;
+
+
+
+    	}
+
+    	if(!gpio_get_level(GPI_Stp)){  //Step simulator
+    		input=0;
+ 			valor_ant = 0;
+ 			error_ant2 = 0;
+ 			error_ant = 0;
+    	}
+
+
+			valor_ant = input;
+			error_ant2 = error_ant;
+			error_ant = error;
+
+    	if(input>MaxPWM){gpio_set_level(GPO_Sat, 1);}
+    	else{gpio_set_level(GPO_Sat, 0);}
+
+
+    	input=constrain(input,0,MaxPWM); //constrain values
+    	int resta =MaxPWM - input;
+    	ledc_set_duty(pwm_channel.speed_mode, pwm_channel.channel, resta); //set pwm
+    	ledc_update_duty(pwm_channel.speed_mode, pwm_channel.channel);
+
+        //printf("err:%7.2f W:%7.2f input:%d \n",error,W,input); //terminal
+
+
+    	printf("%d",SetPoint);
+    	printf("\t");
+    	printf("%3.2f",W);
+    	printf("\n");
+
+    }
+}
+
+
+
+
+void gpio_init()
+{	gpio_reset_pin(GPO_Sat);
+
+	gpio_set_direction(GPO_Sat, GPIO_MODE_OUTPUT);
+	gpio_set_direction(GPI_Stp, GPIO_MODE_INPUT);
+    gpio_set_direction(GPI_M1, GPIO_MODE_INPUT);
+    gpio_set_direction(GPI_M2, GPIO_MODE_INPUT);
+
+    gpio_set_pull_mode(GPI_Stp, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(GPI_M1, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(GPI_M2, GPIO_PULLUP_ONLY);
+}
+
+void ADC_init(){
+
+	adc1_config_width(ADC_WIDTH_BIT_10);
+	adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11);
+
+}
+
+void ledc_init()
+{
+    pwm_timer.duty_resolution = LEDC_TIMER_13_BIT; // resolution of PWM duty
+    pwm_timer.freq_hz = 5000;                      // frequency of PWM signal
+    pwm_timer.speed_mode = LEDC_HIGH_SPEED_MODE;   // timer mode
+    pwm_timer.timer_num = LEDC_TIMER_0;            // timer index
+    pwm_timer.clk_cfg = LEDC_AUTO_CLK;              // Auto select the source clock
+
+
+    ledc_timer_config(&pwm_timer);
+
+    pwm_channel.channel    = LEDC_CHANNEL_0;
+    pwm_channel.duty       = 0;
+    pwm_channel.gpio_num   = PWM_GPIO;
+    pwm_channel.speed_mode = LEDC_HIGH_SPEED_MODE;
+    pwm_channel.hpoint     = 0;
+    pwm_channel.timer_sel  = LEDC_TIMER_0;
+
+    // Set LED Controller with previously prepared configuration
+    ledc_channel_config(&pwm_channel);
+}
+// Initialize Pulse counter functions:
+static void pcnt_init(int unit)
+{
+    // Set PCNT input signal and control GPIOs
+    	    pcnt_config_t pcnt_config = {
+    	        .pulse_gpio_num = PCNT_INPUT_SIG_IO,
+    	        .ctrl_gpio_num = GPIO_NUM_NC,     // Use PCNT_CTRL_DISABLE to disable control GPIO
+    	        .channel = PCNT_CHANNEL_0,
+    	        .unit = unit,
+    	        .pos_mode = PCNT_COUNT_INC,          // Count both rising and falling edges
+    	        .lctrl_mode = PCNT_MODE_KEEP,        // Keep the control line low
+    	        .hctrl_mode = PCNT_MODE_KEEP,        // Keep the control line high
+    	        .counter_h_lim = 0,
+    	        .counter_l_lim = 0,
+    	    };
+
+    	    pcnt_unit_config(&pcnt_config);
+    	    pcnt_set_filter_value(PCNT_UNIT_0, 100);
+    	    pcnt_filter_enable(PCNT_UNIT_0);
+}
+
+int constrain(int val,int Linf, int Lsup){
+	if(val>Lsup){val=Lsup;}
+	else if(val<Linf){val=Linf;}
+	return val;
+}
